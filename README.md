@@ -3,7 +3,7 @@ This is a simple utility to migrate Kafka consumer group IDs by cloning the offs
 Usage:
 
 ````
- migrate-consuler-group <action> <broker> <topic> <existing.group.id> <new.group.id> [<login> <password>]
+ migrate-consumer-group <action> <broker> <topic> <existing.group.id> <new.group.id> [<login> <password>]
   action is one of:
     try        do not proceed with any change
     do         proceed but abort if new the group already exists

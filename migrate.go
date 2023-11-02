@@ -50,6 +50,7 @@ func main() {
 		DialTimeout: 30 * time.Second,
 	}
 
+	// Handle extra parameters for SCRAM-based authentication
 	if len(os.Args) == 8 {
 		user := os.Args[6]
 		password := os.Args[7]
@@ -66,6 +67,7 @@ func main() {
 		Transport: &transport,
 	}
 
+	// Describe both existing and new groups. It should succeed even if the new group does not exist.
 	fmt.Printf("Fetching offsets of topic %s for groups %s and %s...\n", topic, existingGroup, newGroup)
 	describeResponse, describeError := client.DescribeGroups(ctx, &kafka.DescribeGroupsRequest{
 		GroupIDs: []string{existingGroup, newGroup},
@@ -74,18 +76,23 @@ func main() {
 		fmt.Printf("Error: %s\n", fmt.Errorf("failed to describe existing group: %w", describeError))
 		os.Exit(1)
 	}
+
+	// Obviously we'd rather have the existing group... well... exist.
 	descriptionOfExisting := describeResponse.Groups[0]
 	if descriptionOfExisting.Error != nil {
 		fmt.Printf("Error: %s\n", fmt.Errorf("failed to describe existing group: %w", descriptionOfExisting.Error))
 		os.Exit(1)
 	}
 
+	// And also, we do not want to deal with an existing group that is a moving target, so we want the
+	// group to be currently empty (i.e. all the consumers have been stopped).
 	fmt.Printf("Checking group %v state...\n", existingGroup)
 	if descriptionOfExisting.GroupState != "Empty" {
 		fmt.Printf("Error: existing group %s state is \"%s\" but should be \"Empty\"\n", existingGroup, descriptionOfExisting.GroupState)
 		os.Exit(1)
 	}
 
+	// Let's check that the topic exist and get an idea on how many partitions there are.
 	fmt.Printf("Retrieving topic %v metadata...\n", topic)
 	topicMetadataResponse, topicMetadataError := client.Metadata(ctx, &kafka.MetadataRequest{
 		Topics: []string{topic},
@@ -106,9 +113,11 @@ func main() {
 		allPartitions[partitionId] = partitionId
 	}
 
+	// We're now going to do some efforts to check if the new group already exists
 	fmt.Printf("Checking group %v state...\n", newGroup)
 	descriptionOfNew := describeResponse.Groups[1]
 	if descriptionOfNew.Error == nil && descriptionOfNew.GroupState != "Dead" {
+		// It seems to exist, so let's try to see if any of the offsets are set
 		fmt.Printf("Fetching existing offsets of topic %v for group %v...\n", topic, newGroup)
 		newOffsetFetchResponse, newOffsetFetchResponseError := client.OffsetFetch(ctx, &kafka.OffsetFetchRequest{GroupID: newGroup, Topics: map[string][]int{topic: allPartitions}})
 		if newOffsetFetchResponseError != nil {
@@ -124,6 +133,8 @@ func main() {
 			}
 		}
 
+		// So not only the new group already exists, but it has some existing offsets. That's not good, as we're going to
+		// override these and lose them forever...
 		if atLeastOneOffset {
 			switch action {
 			case ACTION_DO:
@@ -139,6 +150,7 @@ func main() {
 
 	}
 
+	// Let's read the offsets that we need to copy.
 	fmt.Printf("Fetching existing offsets of topic %v for group %v...\n", topic, existingGroup)
 	offsetFetchResponse, offsetFetchResponseError := client.OffsetFetch(ctx, &kafka.OffsetFetchRequest{GroupID: existingGroup, Topics: map[string][]int{topic: allPartitions}})
 	if offsetFetchResponseError != nil {
@@ -155,6 +167,7 @@ func main() {
 		offsets[offsetForPartitionResponse.Partition] = offsetForPartitionResponse.CommittedOffset
 	}
 
+	// And let's prepare the commit payload.
 	messagesToCommit := make([]kafka.Message, 0)
 	for partitionId := 0; partitionId < len(offsets); partitionId++ {
 		if offsets[partitionId] > 0 {
@@ -168,19 +181,25 @@ func main() {
 			fmt.Printf("Skipping partition %s:%v as it has no commit offset\n", topic, partitionId)
 		}
 	}
+
+	// Here we go, let's do the actual update.
 	if len(messagesToCommit) > 0 {
 		if action == ACTION_DO || action == ACTION_FORCE {
+			// This is the danger zone! In order to create or update a group, we need to register as this group.
+			// The easiest way is to just create a new reader...
 			reader := kafka.NewReader(kafka.ReaderConfig{
 				Brokers:     []string{broker},
 				GroupID:     newGroup,
 				GroupTopics: []string{topic},
 			})
+			// We update the offsets by issuing a commit message.
 			commitError := reader.CommitMessages(ctx, messagesToCommit...)
 			if commitError != nil {
 				fmt.Printf("Error: %s\n", fmt.Errorf("failed to store offsets for topic %s: %w", topic, commitError))
 				os.Exit(1)
 			}
 			fmt.Printf("Set %v offset(s) to topic %s for group %s\n", len(messagesToCommit), topic, newGroup)
+			// Close the reader.
 			closeError := reader.Close()
 			if closeError != nil {
 				fmt.Printf("Error: %s\n", fmt.Errorf("failed to shutdown reader: %w", closeError))
