@@ -86,21 +86,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("Checking group %v state...\n", newGroup)
-	descriptionOfNew := describeResponse.Groups[1]
-	if descriptionOfNew.Error == nil && descriptionOfNew.GroupState != "Dead" {
-		switch action {
-		case ACTION_DO:
-			fmt.Printf("Error: target group %s already exists for topic %s. Use action \"do-force\" to override\n", newGroup, topic)
-			os.Exit(1)
-		case ACTION_FORCE:
-			fmt.Printf("[Warn] Target group %s already exists for topic %s and will be overriden\n", newGroup, topic)
-			break
-		case ACTION_TRY:
-			fmt.Printf("[Warn] Target group %s already exists for topic %s. Use action \"%s\" to override\n", newGroup, topic, ACTION_FORCE)
-		}
-	}
-
 	fmt.Printf("Retrieving topic %v metadata...\n", topic)
 	topicMetadataResponse, topicMetadataError := client.Metadata(ctx, &kafka.MetadataRequest{
 		Topics: []string{topic},
@@ -121,20 +106,53 @@ func main() {
 		allPartitions[partitionId] = partitionId
 	}
 
+	fmt.Printf("Checking group %v state...\n", newGroup)
+	descriptionOfNew := describeResponse.Groups[1]
+	if descriptionOfNew.Error == nil && descriptionOfNew.GroupState != "Dead" {
+		fmt.Printf("Fetching existing offsets of topic %v for group %v...\n", topic, newGroup)
+		newOffsetFetchResponse, newOffsetFetchResponseError := client.OffsetFetch(ctx, &kafka.OffsetFetchRequest{GroupID: newGroup, Topics: map[string][]int{topic: allPartitions}})
+		if newOffsetFetchResponseError != nil {
+			fmt.Printf("Error: %s\n", fmt.Errorf("failed to fetch offsets of topic %s for group %s: %w", topic, newGroup, newOffsetFetchResponseError))
+			os.Exit(1)
+		}
+		atLeastOneOffset := false
+		for i := 0; i < len(newOffsetFetchResponse.Topics[topic]); i++ {
+			offsetForPartitionResponse := newOffsetFetchResponse.Topics[topic][i]
+			if offsetForPartitionResponse.Error == nil && offsetForPartitionResponse.CommittedOffset > 0 {
+				fmt.Printf("Existing offset %s:%v is %v\n", topic, offsetForPartitionResponse.Partition, offsetForPartitionResponse.CommittedOffset)
+				atLeastOneOffset = true
+			}
+		}
+
+		if atLeastOneOffset {
+			switch action {
+			case ACTION_DO:
+				fmt.Printf("Error: target group %s already exists for topic %s. Use action \"do-force\" to override\n", newGroup, topic)
+				os.Exit(1)
+			case ACTION_FORCE:
+				fmt.Printf("[Warn] Target group %s already exists for topic %s and will be overriden\n*** WRITE THE ABOVE EXISTING OFFSETS DOWN! ***\n*** YOU MAY NEED THEM TO RECOVER IF ANYTHING GOES WRONG! ***\n", newGroup, topic)
+				break
+			case ACTION_TRY:
+				fmt.Printf("[Warn] Target group %s already exists for topic %s. Use action \"%s\" to override\n", newGroup, topic, ACTION_FORCE)
+			}
+		}
+
+	}
+
 	fmt.Printf("Fetching existing offsets of topic %v for group %v...\n", topic, existingGroup)
 	offsetFetchResponse, offsetFetchResponseError := client.OffsetFetch(ctx, &kafka.OffsetFetchRequest{GroupID: existingGroup, Topics: map[string][]int{topic: allPartitions}})
 	if offsetFetchResponseError != nil {
-		fmt.Printf("Error: %s\n", fmt.Errorf("failed to fetch offsets for topic %s: %w", topic, offsetFetchResponseError))
+		fmt.Printf("Error: %s\n", fmt.Errorf("failed to fetch offsets of topic %s for group %s: %w", topic, newGroup, offsetFetchResponseError))
 		os.Exit(1)
 	}
 	offsets := make([]int64, len(topicMetadata.Partitions))
-	for partitionId := 0; partitionId < len(allPartitions); partitionId++ {
-		offsetForPartitionResponse := offsetFetchResponse.Topics[topic][partitionId]
+	for i := 0; i < len(offsetFetchResponse.Topics[topic]); i++ {
+		offsetForPartitionResponse := offsetFetchResponse.Topics[topic][i]
 		if offsetForPartitionResponse.Error != nil {
-			fmt.Printf("Error: %s\n", fmt.Errorf("failed to fetch offsets for topic %s:%v: %w", topic, partitionId, offsetForPartitionResponse.Error))
+			fmt.Printf("Error: %s\n", fmt.Errorf("failed to fetch offsets of topic %s:%v for group %v: %w", topic, offsetForPartitionResponse.Partition, newGroup, offsetForPartitionResponse.Error))
 			os.Exit(1)
 		}
-		offsets[partitionId] = offsetForPartitionResponse.CommittedOffset
+		offsets[offsetForPartitionResponse.Partition] = offsetForPartitionResponse.CommittedOffset
 	}
 
 	messagesToCommit := make([]kafka.Message, 0)
