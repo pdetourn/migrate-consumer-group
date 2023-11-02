@@ -9,3 +9,9 @@ Usage:
     do         proceed but abort if new the group already exists
     do-force   proceed even if new the group already exists```
 ````
+
+How to build:
+
+```
+go build .
+```
