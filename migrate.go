@@ -3,12 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
-	"net"
 	"os"
-	"time"
 
-	kafka "github.com/segmentio/kafka-go"
-	"github.com/segmentio/kafka-go/sasl/scram"
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 )
 
 type Action string
@@ -43,43 +40,37 @@ func main() {
 		usage()
 	}
 
-	transport := kafka.Transport{
-		Dial: (&net.Dialer{
-			Timeout: 20 * time.Second,
-		}).DialContext,
-		DialTimeout: 30 * time.Second,
+	configMap := kafka.ConfigMap{
+		"bootstrap.servers": broker,
 	}
 
 	// Handle extra parameters for SCRAM-based authentication
 	if len(os.Args) == 8 {
 		user := os.Args[6]
 		password := os.Args[7]
-		mechanism, scramError := scram.Mechanism(scram.SHA512, user, password)
-		if scramError != nil {
-			fmt.Printf("Error: %s\n", fmt.Errorf("failed to initialize SCRAM mechanism: %w", scramError))
-			os.Exit(1)
-		}
-		transport.SASL = mechanism
+		configMap["security.protocol"] = "SASL_SSL"
+		configMap["sasl.mechanisms"] = "SCRAM-SHA-512"
+		configMap["sasl.username"] = user
+		configMap["sasl.password"] = password
 	}
 
-	client := kafka.Client{
-		Addr:      kafka.TCP(broker),
-		Transport: &transport,
+	admin, newAdminError := kafka.NewAdminClient(&configMap)
+	if newAdminError != nil {
+		fmt.Printf("Error: %s\n", fmt.Errorf("failed to create admin client: %w", newAdminError))
+		os.Exit(1)
 	}
 
 	// Describe both existing and new groups. It should succeed even if the new group does not exist.
 	fmt.Printf("Fetching offsets of topic %s for groups %s and %s...\n", topic, existingGroup, newGroup)
-	describeResponse, describeError := client.DescribeGroups(ctx, &kafka.DescribeGroupsRequest{
-		GroupIDs: []string{existingGroup, newGroup},
-	})
+	describeResponse, describeError := admin.DescribeConsumerGroups(ctx, []string{existingGroup, newGroup})
 	if describeError != nil {
 		fmt.Printf("Error: %s\n", fmt.Errorf("failed to describe existing group: %w", describeError))
 		os.Exit(1)
 	}
 
 	// Obviously we'd rather have the existing group... well... exist.
-	descriptionOfExisting := describeResponse.Groups[0]
-	if descriptionOfExisting.Error != nil {
+	descriptionOfExisting := describeResponse.ConsumerGroupDescriptions[0]
+	if descriptionOfExisting.Error.Code() != kafka.ErrNoError {
 		fmt.Printf("Error: %s\n", fmt.Errorf("failed to describe existing group: %w", descriptionOfExisting.Error))
 		os.Exit(1)
 	}
@@ -87,22 +78,20 @@ func main() {
 	// And also, we do not want to deal with an existing group that is a moving target, so we want the
 	// group to be currently empty (i.e. all the consumers have been stopped).
 	fmt.Printf("Checking group %v state...\n", existingGroup)
-	if descriptionOfExisting.GroupState != "Empty" {
-		fmt.Printf("Error: existing group %s state is \"%s\" but should be \"Empty\"\n", existingGroup, descriptionOfExisting.GroupState)
+	if descriptionOfExisting.State != kafka.ConsumerGroupStateEmpty {
+		fmt.Printf("Error: existing group %s state is \"%s\" but should be \"Empty\"\n", existingGroup, descriptionOfExisting.State)
 		os.Exit(1)
 	}
 
 	// Let's check that the topic exist and get an idea on how many partitions there are.
 	fmt.Printf("Retrieving topic %v metadata...\n", topic)
-	topicMetadataResponse, topicMetadataError := client.Metadata(ctx, &kafka.MetadataRequest{
-		Topics: []string{topic},
-	})
+	topicMetadataResponse, topicMetadataError := admin.GetMetadata(&topic, false, 15_000)
 	if topicMetadataError != nil {
 		fmt.Printf("Error: %s\n", fmt.Errorf("failed to retreive topic %s metadata: %w", topic, topicMetadataError))
 		os.Exit(1)
 	}
-	topicMetadata := topicMetadataResponse.Topics[0]
-	if topicMetadata.Error != nil {
+	topicMetadata := topicMetadataResponse.Topics[topic]
+	if topicMetadata.Error.Code() != kafka.ErrNoError {
 		fmt.Printf("Error: %s\n", fmt.Errorf("failed to retreive topic %s metadata: %w", topic, topicMetadata.Error))
 		os.Exit(1)
 	}
@@ -115,20 +104,26 @@ func main() {
 
 	// We're now going to do some efforts to check if the new group already exists
 	fmt.Printf("Checking group %v state...\n", newGroup)
-	descriptionOfNew := describeResponse.Groups[1]
-	if descriptionOfNew.Error == nil && descriptionOfNew.GroupState != "Dead" {
+	descriptionOfNew := describeResponse.ConsumerGroupDescriptions[1]
+	if descriptionOfNew.Error.Code() == kafka.ErrNoError && descriptionOfNew.State != kafka.ConsumerGroupStateDead {
 		// It seems to exist, so let's try to see if any of the offsets are set
 		fmt.Printf("Fetching existing offsets of topic %v for group %v...\n", topic, newGroup)
-		newOffsetFetchResponse, newOffsetFetchResponseError := client.OffsetFetch(ctx, &kafka.OffsetFetchRequest{GroupID: newGroup, Topics: map[string][]int{topic: allPartitions}})
+		newOffsetFetchResponse, newOffsetFetchResponseError := admin.ListConsumerGroupOffsets(
+			ctx, []kafka.ConsumerGroupTopicPartitions{
+				{
+					Group: newGroup,
+				},
+			},
+		)
 		if newOffsetFetchResponseError != nil {
 			fmt.Printf("Error: %s\n", fmt.Errorf("failed to fetch offsets of topic %s for group %s: %w", topic, newGroup, newOffsetFetchResponseError))
 			os.Exit(1)
 		}
 		atLeastOneOffset := false
-		for i := 0; i < len(newOffsetFetchResponse.Topics[topic]); i++ {
-			offsetForPartitionResponse := newOffsetFetchResponse.Topics[topic][i]
-			if offsetForPartitionResponse.Error == nil && offsetForPartitionResponse.CommittedOffset > 0 {
-				fmt.Printf("Existing offset %s:%v is %v\n", topic, offsetForPartitionResponse.Partition, offsetForPartitionResponse.CommittedOffset)
+		for i := 0; i < len(newOffsetFetchResponse.ConsumerGroupsTopicPartitions[0].Partitions); i++ {
+			offsetForPartitionResponse := newOffsetFetchResponse.ConsumerGroupsTopicPartitions[0].Partitions[i]
+			if offsetForPartitionResponse.Error == nil && offsetForPartitionResponse.Offset > 0 && *offsetForPartitionResponse.Topic == topic {
+				fmt.Printf("Existing offset %s:%v is %v\n", topic, offsetForPartitionResponse.Partition, offsetForPartitionResponse.Offset)
 				atLeastOneOffset = true
 			}
 		}
@@ -152,30 +147,36 @@ func main() {
 
 	// Let's read the offsets that we need to copy.
 	fmt.Printf("Fetching existing offsets of topic %v for group %v...\n", topic, existingGroup)
-	offsetFetchResponse, offsetFetchResponseError := client.OffsetFetch(ctx, &kafka.OffsetFetchRequest{GroupID: existingGroup, Topics: map[string][]int{topic: allPartitions}})
+	offsetFetchResponse, offsetFetchResponseError := admin.ListConsumerGroupOffsets(ctx, []kafka.ConsumerGroupTopicPartitions{
+		{
+			Group: existingGroup,
+		},
+	})
 	if offsetFetchResponseError != nil {
 		fmt.Printf("Error: %s\n", fmt.Errorf("failed to fetch offsets of topic %s for group %s: %w", topic, newGroup, offsetFetchResponseError))
 		os.Exit(1)
 	}
-	offsets := make([]int64, len(topicMetadata.Partitions))
-	for i := 0; i < len(offsetFetchResponse.Topics[topic]); i++ {
-		offsetForPartitionResponse := offsetFetchResponse.Topics[topic][i]
-		if offsetForPartitionResponse.Error != nil {
-			fmt.Printf("Error: %s\n", fmt.Errorf("failed to fetch offsets of topic %s:%v for group %v: %w", topic, offsetForPartitionResponse.Partition, newGroup, offsetForPartitionResponse.Error))
-			os.Exit(1)
+	offsets := map[int32]kafka.Offset{}
+	for i := 0; i < len(offsetFetchResponse.ConsumerGroupsTopicPartitions[0].Partitions); i++ {
+		offsetForPartitionResponse := offsetFetchResponse.ConsumerGroupsTopicPartitions[0].Partitions[i]
+		if *offsetForPartitionResponse.Topic == topic {
+			if offsetForPartitionResponse.Error != nil {
+				fmt.Printf("Error: %s\n", fmt.Errorf("failed to fetch offsets of topic %s:%v for group %v: %w", topic, offsetForPartitionResponse.Partition, newGroup, offsetForPartitionResponse.Error))
+				os.Exit(1)
+			}
+			offsets[offsetForPartitionResponse.Partition] = offsetForPartitionResponse.Offset
 		}
-		offsets[offsetForPartitionResponse.Partition] = offsetForPartitionResponse.CommittedOffset
 	}
 
 	// And let's prepare the commit payload.
-	messagesToCommit := make([]kafka.Message, 0)
-	for partitionId := 0; partitionId < len(offsets); partitionId++ {
-		if offsets[partitionId] > 0 {
+	partitionsToCommit := make([]kafka.TopicPartition, 0)
+	for partitionId, offset := range offsets {
+		if offset > 0 {
 			fmt.Printf("Preparing to set offset of partition %s:%v to %v\n", topic, partitionId, offsets[partitionId])
-			messagesToCommit = append(messagesToCommit, kafka.Message{
-				Topic:     topic,
+			partitionsToCommit = append(partitionsToCommit, kafka.TopicPartition{
+				Topic:     &topic,
 				Partition: partitionId,
-				Offset:    offsets[partitionId] - 1,
+				Offset:    offset,
 			})
 		} else {
 			fmt.Printf("Skipping partition %s:%v as it has no commit offset\n", topic, partitionId)
@@ -183,30 +184,21 @@ func main() {
 	}
 
 	// Here we go, let's do the actual update.
-	if len(messagesToCommit) > 0 {
+	if len(partitionsToCommit) > 0 {
 		if action == ACTION_DO || action == ACTION_FORCE {
-			// This is the danger zone! In order to create or update a group, we need to register as this group.
-			// The easiest way is to just create a new reader...
-			reader := kafka.NewReader(kafka.ReaderConfig{
-				Brokers:     []string{broker},
-				GroupID:     newGroup,
-				GroupTopics: []string{topic},
+			// Update the offsets.
+			_, alterError := admin.AlterConsumerGroupOffsets(ctx, []kafka.ConsumerGroupTopicPartitions{
+				{
+					Group:      newGroup,
+					Partitions: partitionsToCommit,
+				},
 			})
-			// We update the offsets by issuing a commit message.
-			commitError := reader.CommitMessages(ctx, messagesToCommit...)
-			if commitError != nil {
-				fmt.Printf("Error: %s\n", fmt.Errorf("failed to store offsets for topic %s: %w", topic, commitError))
-				os.Exit(1)
-			}
-			fmt.Printf("Set %v offset(s) to topic %s for group %s\n", len(messagesToCommit), topic, newGroup)
-			// Close the reader.
-			closeError := reader.Close()
-			if closeError != nil {
-				fmt.Printf("Error: %s\n", fmt.Errorf("failed to shutdown reader: %w", closeError))
+			if alterError != nil {
+				fmt.Printf("Error: %s\n", fmt.Errorf("failed to alter offsets of topic %s for group %v: %w", topic, newGroup, alterError))
 				os.Exit(1)
 			}
 		} else {
-			fmt.Printf("[Skipped - try mode] Set %v offsets to topic %s for group %s\n", len(messagesToCommit), topic, newGroup)
+			fmt.Printf("[Skipped - try mode] Set %v offsets to topic %s for group %s\n", len(partitionsToCommit), topic, newGroup)
 		}
 	} else {
 		fmt.Printf("No offsets set to group %s\n", newGroup)
