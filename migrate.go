@@ -197,6 +197,7 @@ func main() {
 				fmt.Printf("Error: %s\n", fmt.Errorf("failed to alter offsets of topic %s for group %v: %w", topic, newGroup, alterError))
 				os.Exit(1)
 			}
+			fmt.Printf("Set %v offset(s) to topic %s for group %s\n", len(partitionsToCommit), topic, newGroup)
 		} else {
 			fmt.Printf("[Skipped - try mode] Set %v offsets to topic %s for group %s\n", len(partitionsToCommit), topic, newGroup)
 		}
